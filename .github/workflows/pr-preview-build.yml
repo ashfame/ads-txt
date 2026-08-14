@@ -1,0 +1,125 @@
+name: PR Preview - Build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    uses: WordPress/action-wp-playground-pr-preview/.github/workflows/preview-build.yml@v3
+    with:
+      artifacts: ads-txt=preview-artifacts/ads-txt.zip
+      build-command: |
+        set -euo pipefail
+        test "$(git rev-parse --show-toplevel)" = "$PWD"
+        test ! -e preview-artifacts
+        mkdir preview-artifacts
+        export_tar="$(mktemp "${RUNNER_TEMP:?}/ads-txt-export.XXXXXX.tar")"
+        cleanup() {
+          rm -f -- "$export_tar"
+        }
+        trap cleanup EXIT
+        git archive --format=tar --prefix=ads-txt/ --output="$export_tar" HEAD
+        git archive --format=zip --prefix=ads-txt/ --output=preview-artifacts/ads-txt.zip HEAD
+        python3 - "$export_tar" preview-artifacts/ads-txt.zip "$(git rev-parse HEAD)" <<'PY'
+        import hashlib
+        import re
+        import sys
+        import tarfile
+        import unicodedata
+        import zipfile
+        from pathlib import Path
+
+        tar_path = Path(sys.argv[1]).resolve(strict=True)
+        zip_path = Path(sys.argv[2]).resolve(strict=True)
+        head = sys.argv[3]
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
+            raise SystemExit("HEAD is not a lowercase 40-character Git SHA")
+        if not 0 < zip_path.stat().st_size <= 16 * 1024 * 1024:
+            raise SystemExit("preview ZIP exceeds its archive-size bound")
+
+        def validate_name(name):
+            if not name.startswith("ads-txt/") or name.startswith("/") or "\\" in name:
+                raise SystemExit(f"unsafe archive path: {name!r}")
+            if len(name.encode("utf-8")) > 1024 or unicodedata.normalize("NFC", name) != name:
+                raise SystemExit(f"unsupported archive path: {name!r}")
+            parts = name.rstrip("/").split("/")
+            if any(part in ("", ".", "..") or any(ord(character) < 32 or ord(character) == 127 for character in part) for part in parts):
+                raise SystemExit(f"ambiguous archive path: {name!r}")
+
+        expected = {}
+        with tarfile.open(tar_path, "r:") as archive:
+            members = archive.getmembers()
+            if not 1 <= len(members) <= 2048:
+                raise SystemExit("Git export exceeds its entry-count bound")
+            for member in members:
+                name = member.name + ("/" if member.isdir() and not member.name.endswith("/") else "")
+                validate_name(name)
+                key = unicodedata.normalize("NFC", name.rstrip("/")).casefold()
+                if key in expected:
+                    raise SystemExit(f"colliding Git export path: {name!r}")
+                if member.isdir():
+                    expected[key] = (name, None)
+                elif member.isreg():
+                    if not 0 <= member.size <= 16 * 1024 * 1024:
+                        raise SystemExit(f"Git export entry exceeds its size bound: {name!r}")
+                    fileobj = archive.extractfile(member)
+                    if fileobj is None:
+                        raise SystemExit(f"Git export entry is unreadable: {name!r}")
+                    expected[key] = (name, hashlib.sha256(fileobj.read()).digest())
+                else:
+                    raise SystemExit(f"Git export contains an unsupported type: {name!r}")
+
+        seen = {}
+        expanded = 0
+        with zipfile.ZipFile(zip_path) as archive:
+            if archive.comment != head.encode("ascii"):
+                raise SystemExit("preview ZIP is not bound to the checked-out Git SHA")
+            infos = archive.infolist()
+            if len(infos) != len(expected):
+                raise SystemExit("preview ZIP entry count differs from the Git export")
+            for info in infos:
+                name = info.filename
+                validate_name(name)
+                key = unicodedata.normalize("NFC", name.rstrip("/")).casefold()
+                if key in seen:
+                    raise SystemExit(f"colliding preview ZIP path: {name!r}")
+                seen[key] = name
+                if key not in expected or expected[key][0] != name:
+                    raise SystemExit(f"preview ZIP path differs from the Git export: {name!r}")
+                if info.flag_bits & 1 or info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    raise SystemExit(f"preview ZIP entry has unsupported encoding: {name!r}")
+                expected_hash = expected[key][1]
+                if info.is_dir():
+                    if expected_hash is not None or info.file_size != 0:
+                        raise SystemExit(f"preview ZIP directory differs from the Git export: {name!r}")
+                else:
+                    if expected_hash is None or not 0 <= info.file_size <= 16 * 1024 * 1024:
+                        raise SystemExit(f"preview ZIP file differs from the Git export: {name!r}")
+                    expanded += info.file_size
+                    if expanded > 32 * 1024 * 1024:
+                        raise SystemExit("preview ZIP exceeds its expanded-size bound")
+                    with archive.open(info) as source:
+                        digest = hashlib.sha256(source.read()).digest()
+                    if digest != expected_hash:
+                        raise SystemExit(f"preview ZIP bytes differ from the Git export: {name!r}")
+            bad_entry = archive.testzip()
+            if bad_entry is not None:
+                raise SystemExit(f"preview ZIP CRC failed: {bad_entry!r}")
+
+        if set(seen) != set(expected):
+            raise SystemExit("preview ZIP paths differ from the Git export")
+        required = {"ads-txt/ads-txt.php", "ads-txt/readme.txt"}
+        if not required.issubset(set(seen.values())):
+            raise SystemExit("preview ZIP is missing required plugin files")
+        forbidden_prefixes = ("ads-txt/.github/", "ads-txt/.wordpress-org/", "ads-txt/node_modules/", "ads-txt/tests/", "ads-txt/vendor/")
+        forbidden_files = {"ads-txt/composer.json", "ads-txt/composer.lock", "ads-txt/package.json", "ads-txt/package-lock.json", "ads-txt/README.md"}
+        if any(name.startswith(forbidden_prefixes) or name in forbidden_files for name in seen.values()):
+            raise SystemExit("preview ZIP contains a development-only path excluded by the release contract")
+        print(f"Validated ads-txt preview ZIP: {len(seen)} entries, {expanded} expanded bytes, {zip_path.stat().st_size} archive bytes")
+        PY
